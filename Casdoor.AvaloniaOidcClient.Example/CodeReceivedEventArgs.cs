@@ -4,7 +4,12 @@ namespace Casdoor.AvaloniaOidcClient.Example;
 
 public class CodeReceivedEventArgs : EventArgs
 {
-    public CodeReceivedEventArgs(string code) => Code = code;
+    public CodeReceivedEventArgs(string code, string codeVerifier)
+    {
+        Code = code;
+        CodeVerifier = codeVerifier;
+    }
 
     public string Code { get; }
+    public string CodeVerifier { get; }
 }

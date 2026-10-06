@@ -8,7 +8,7 @@
         x:Class="Casdoor.AvaloniaOidcClient.Example.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/avalonia-logo.ico"
-        Title="Casdoor.AvaloniaOidcClient.Example">
+        Title="Casdoor Avalonia Example">
 
 	<views:AccountView/>
 </Window>

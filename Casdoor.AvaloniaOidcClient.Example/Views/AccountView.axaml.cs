@@ -1,81 +1,157 @@
-using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
-using Avalonia.Markup.Xaml;
-using System.Web;
+using Avalonia.Threading;
 using System;
+using System.Security.Cryptography;
+using System.Web;
+using WebViewCore.Enums;
+using WebViewCore.Events;
 
 namespace Casdoor.AvaloniaOidcClient.Example.Views;
 
+/// <summary>
+/// Shows the Casdoor sign-in page in a WebView, catches the redirect to the callback URL
+/// and exchanges the code for the tokens with PKCE.
+/// </summary>
 public partial class AccountView : UserControl
 {
-    private readonly CasdoorApi _casdoorApi;
-    private string? _authCode;
+    // PKCE: only the app that started the sign-in knows the verifier, so a stolen code is useless
+    private string _codeVerifier = "";
+    // the state ties the callback to this sign-in
+    private string _state = "";
+    private bool _signingIn;
+
     public AccountView()
     {
         InitializeComponent();
         Loaded += AccountView_Loaded;
-        _casdoorApi = new CasdoorApi(CasdoorVariables.Domain);
-        this.CodeReceived += LoginWindow_CodeReceived;
+        CodeReceived += AccountView_CodeReceived;
     }
 
+    public event EventHandler<CodeReceivedEventArgs>? CodeReceived;
 
-    private async void LoginWindow_CodeReceived(object? sender, CodeReceivedEventArgs e)
+    private static string RandomString()
     {
-        _authCode = e.Code;
-
-        var token = await _casdoorApi.RequestToken(
-            CasdoorVariables.ClientId,
-            CasdoorVariables.ClientSecret,
-            _authCode
-        );
-
-        // Assume request token and get user process is in happy path..
-        var user = await _casdoorApi.GetUserInfo(token!);
-
-        UsernameLabel.Content = user.Name;
-        EmailLabel.Content = user.Email;
-
-        WebPanel.IsVisible = false;
-        StartPanel.IsVisible = false;
-        AccountPanel.IsVisible = true;
+        return Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+            .Replace("+", "-").Replace("/", "_").Replace("=", "");
     }
 
-    private string GetLoginUrl()
-          => $"{CasdoorVariables.Domain}/login/oauth/authorize?client_id={CasdoorVariables.ClientId}&response_type=code&redirect_uri={CasdoorVariables.CallbackUrl}&scope=profile,email&state={CasdoorVariables.AppName}&noRedirect=true";
+    private void AccountView_Loaded(object? sender, RoutedEventArgs e)
+    {
+        // Casdoor goes to the callback URL either in the page or in a new window
+        PART_WebView.NavigationStarting += PART_WebView_NavigationStarting;
+        PART_WebView.WebViewNewWindowRequested += PART_WebView_WebViewNewWindowRequested;
+    }
+
     private void LoginBtn_Click(object sender, RoutedEventArgs e)
     {
-        WebPanel.IsVisible = true;
-        AccountPanel.IsVisible = false;
-        StartPanel.IsVisible = false;
-        PART_WebView.Url = new Uri(GetLoginUrl());
+        _codeVerifier = RandomString();
+        _state = RandomString();
+        _signingIn = true;
+
+        var loginUrl = CasdoorVariables.Client.GetSigninUrl(_codeVerifier, true)
+            .Replace($"&state={CasdoorVariables.AppName}", $"&state={_state}");
+
+        ShowPanel(WebPanel);
+        PART_WebView.Url = new Uri(loginUrl);
     }
 
     private void LogoutBtn_Click(object sender, RoutedEventArgs e)
     {
-        PART_WebView.Url = new Uri($"{CasdoorVariables.Domain}/api/logout?client_id={CasdoorVariables.ClientId}&returnTo={CasdoorVariables.CallbackUrl}");
-        WebPanel.IsVisible = false;
-        AccountPanel.IsVisible = false;
-        StartPanel.IsVisible = true;
+        // ends the Casdoor session of the WebView, so that signing in again asks for the password
+        PART_WebView.Url = new Uri($"{CasdoorVariables.Domain}/api/logout");
+        ShowPanel(StartPanel);
     }
 
-
-    private void AccountView_Loaded(object? sender, RoutedEventArgs e)
+    private void PART_WebView_NavigationStarting(object? sender, WebViewUrlLoadingEventArg e)
     {
-        PART_WebView.WebViewNewWindowRequested += PART_WebView_WebViewNewWindowRequested;
-    }
-
-    private void PART_WebView_WebViewNewWindowRequested(object? sender, WebViewCore.Events.WebViewNewWindowEventArgs e)
-    {
-        string GetCodeFromUrl(string url) => HttpUtility.ParseQueryString(new Uri(url).Query).Get("code")!;
-
-        if (e.Url.AbsoluteUri.StartsWith("casdoor://", StringComparison.OrdinalIgnoreCase))
+        if (e.Url is not null && IsCallback(e.Url))
         {
-            var code = GetCodeFromUrl(e.Url.AbsoluteUri);
-            CodeReceived?.Invoke(this, new CodeReceivedEventArgs(code));
+            e.Cancel = true;
+            HandleCallback(e.Url);
         }
     }
 
-    public event EventHandler<CodeReceivedEventArgs>? CodeReceived;
-}
+    private void PART_WebView_WebViewNewWindowRequested(object? sender, WebViewNewWindowEventArgs e)
+    {
+        if (e.Url is not null && IsCallback(e.Url))
+        {
+            e.UrlLoadingStrategy = UrlRequestStrategy.CancelLoad;
+            HandleCallback(e.Url);
+        }
+    }
 
+    private static bool IsCallback(Uri url)
+    {
+        return url.AbsoluteUri.StartsWith(CasdoorVariables.CallbackUrl, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void HandleCallback(Uri url)
+    {
+        if (!_signingIn)
+        {
+            return;
+        }
+        _signingIn = false;
+
+        var query = HttpUtility.ParseQueryString(url.Query);
+        var code = query.Get("code");
+        var error = query.Get("error");
+        if (!string.IsNullOrEmpty(error))
+        {
+            ShowError($"Failed to sign in: {error} {query.Get("error_description")}");
+        }
+        else if (query.Get("state") != _state || string.IsNullOrEmpty(code))
+        {
+            ShowError("Failed to sign in: invalid state or code, please try again.");
+        }
+        else
+        {
+            var args = new CodeReceivedEventArgs(code, _codeVerifier);
+            Dispatcher.UIThread.Post(() => CodeReceived?.Invoke(this, args));
+        }
+    }
+
+    private async void AccountView_CodeReceived(object? sender, CodeReceivedEventArgs e)
+    {
+        ShowPanel(StartPanel);
+        MessageText.Text = "Loading...";
+
+        try
+        {
+            // exchange the code for the tokens, with the PKCE code verifier instead of a client secret
+            var token = await CasdoorVariables.Client.RequestAuthorizationCodeTokenAsync(
+                e.Code, CasdoorVariables.CallbackUrl, e.CodeVerifier);
+            if (token.IsError || string.IsNullOrEmpty(token.AccessToken))
+            {
+                throw new InvalidOperationException(token.Error ?? "no access token");
+            }
+
+            var user = await CasdoorVariables.Client.UserInfo(token.AccessToken);
+            UsernameLabel.Content = user?.Name;
+            EmailLabel.Content = user?.Email;
+            MessageText.Text = "";
+            ShowPanel(AccountPanel);
+        }
+        catch (Exception ex)
+        {
+            ShowError($"Failed to sign in: {ex.Message}");
+        }
+    }
+
+    private void ShowError(string message)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            ShowPanel(StartPanel);
+            MessageText.Text = message;
+        });
+    }
+
+    private void ShowPanel(Control panel)
+    {
+        StartPanel.IsVisible = panel == StartPanel;
+        AccountPanel.IsVisible = panel == AccountPanel;
+        WebPanel.IsVisible = panel == WebPanel;
+    }
+}
